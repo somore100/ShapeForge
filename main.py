@@ -24,11 +24,12 @@ SHAPE_E_HOME = Path(
 ).expanduser().resolve()
 
 ENGINE = APP_DIR / "engine" / "generate.py"
+SERVER = APP_DIR / "engine" / "server.py"
 OUTPUT = APP_DIR / "generated"
 BATCH_OUTPUT = APP_DIR / "outputs"
 
 
-def run_generator(prompt, output_dir, log_signal):
+def run_generator_oneshot(prompt, output_dir, log_signal):
     command = [
         sys.executable,
         str(ENGINE),
@@ -58,6 +59,22 @@ def run_generator(prompt, output_dir, log_signal):
 
     process.wait()
     return process.returncode
+
+
+import atexit
+from engine.client import PersistentEngine
+
+ENGINE_PROC = PersistentEngine(SERVER, SHAPE_E_HOME)
+atexit.register(ENGINE_PROC.shutdown)
+
+
+def run_generator(prompt, output_dir, log_signal):
+    if SERVER.exists():
+        code = ENGINE_PROC.run(prompt, output_dir, log_signal.emit)
+        if code != 2:
+            return code
+        log_signal.emit("Falling back to one-shot generator...")
+    return run_generator_oneshot(prompt, output_dir, log_signal)
 
 
 class Generator(QThread):
@@ -556,6 +573,7 @@ class ShapeForge(QMainWindow):
             event.ignore()
             return
 
+        ENGINE_PROC.shutdown()
         event.accept()
 
 
