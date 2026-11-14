@@ -1,20 +1,21 @@
 import os
 import sys
+import re
 import subprocess
 import shutil
+from datetime import datetime
 from pathlib import Path
 
 import trimesh
 import numpy as np
 import pyqtgraph.opengl as gl
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, Signal, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QPushButton, QTextEdit,
-    QLineEdit, QFileDialog, QMessageBox, QSplitter
+    QFileDialog, QMessageBox, QSplitter
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -24,58 +25,137 @@ SHAPE_E_HOME = Path(
 
 ENGINE = APP_DIR / "engine" / "generate.py"
 OUTPUT = APP_DIR / "generated"
+BATCH_OUTPUT = APP_DIR / "outputs"
+
+
+def run_generator(prompt, output_dir, log_signal):
+    command = [
+        sys.executable,
+        str(ENGINE),
+        "--prompt", prompt,
+        "--output", str(output_dir)
+    ]
+
+    child_env = os.environ.copy()
+    existing_path = child_env.get("PYTHONPATH", "")
+    child_env["PYTHONPATH"] = (
+        str(SHAPE_E_HOME)
+        + (os.pathsep + existing_path if existing_path else "")
+    )
+
+    process = subprocess.Popen(
+        command,
+        cwd=str(SHAPE_E_HOME),
+        env=child_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    for line in process.stdout:
+        log_signal.emit(line.rstrip())
+
+    process.wait()
+    return process.returncode
 
 
 class Generator(QThread):
     log = Signal(str)
-    finished_generation = Signal(bool, str)
+    finished_generation = Signal(bool, str, str)
 
-    def __init__(self, prompt):
+    def __init__(self, prompt, output_dir):
         super().__init__()
         self.prompt = prompt
+        self.output_dir = Path(output_dir)
 
     def run(self):
         try:
-            command = [
-                sys.executable,
-                str(ENGINE),
-                "--prompt", self.prompt,
-                "--output", str(OUTPUT)
-            ]
-
-            child_env = os.environ.copy()
-            existing_path = child_env.get("PYTHONPATH", "")
-            child_env["PYTHONPATH"] = (
-                str(SHAPE_E_HOME)
-                + (os.pathsep + existing_path if existing_path else "")
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            code = run_generator(
+                self.prompt, self.output_dir, self.log
             )
 
-            process = subprocess.Popen(
-                command,
-                cwd=str(SHAPE_E_HOME),
-                env=child_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
-            )
-
-            for line in process.stdout:
-                self.log.emit(line.rstrip())
-
-            process.wait()
-
-            if process.returncode == 0:
+            if code == 0:
                 self.finished_generation.emit(
-                    True, "Generation completed!"
+                    True, "Generation completed!",
+                    str(self.output_dir)
                 )
             else:
                 self.finished_generation.emit(
-                    False, f"Generator exited with code {process.returncode}"
+                    False, f"Generator exited with code {code}",
+                    str(self.output_dir)
                 )
 
         except Exception as error:
-            self.finished_generation.emit(False, str(error))
+            self.finished_generation.emit(
+                False, str(error), str(self.output_dir)
+            )
+
+
+class BatchGenerator(QThread):
+    log = Signal(str)
+    job_finished = Signal(bool, str, str, int, int)
+    finished_batch = Signal(bool)
+
+    def __init__(self, prompts, batch_dir):
+        super().__init__()
+        self.prompts = prompts
+        self.batch_dir = Path(batch_dir)
+        self.stop_requested = False
+
+    def request_stop(self):
+        self.stop_requested = True
+
+    def run(self):
+        self.batch_dir.mkdir(parents=True, exist_ok=True)
+
+        total = len(self.prompts)
+        stopped = False
+
+        for index, prompt in enumerate(self.prompts, start=1):
+            if self.stop_requested:
+                stopped = True
+                self.log.emit("Batch stopped before the next job.")
+                break
+
+            slug = re.sub(
+                r"[^a-zA-Z0-9]+", "_", prompt.lower()
+            ).strip("_")[:35] or "model"
+
+            job_dir = self.batch_dir / f"{index:02d}_{slug}"
+
+            self.log.emit("")
+            self.log.emit("=" * 42)
+            self.log.emit(f"JOB {index}/{total}")
+            self.log.emit(f"Prompt: {prompt}")
+            self.log.emit(f"Output: {job_dir}")
+            self.log.emit("Starting generation...")
+
+            try:
+                job_dir.mkdir(parents=True, exist_ok=True)
+                code = run_generator(prompt, job_dir, self.log)
+
+                if code == 0:
+                    self.log.emit(f"JOB {index}: COMPLETED")
+                    self.job_finished.emit(
+                        True, prompt, str(job_dir), index, total
+                    )
+                else:
+                    self.log.emit(
+                        f"JOB {index}: FAILED (exit code {code})"
+                    )
+                    self.job_finished.emit(
+                        False, prompt, str(job_dir), index, total
+                    )
+
+            except Exception as error:
+                self.log.emit(f"JOB {index}: ERROR - {error}")
+                self.job_finished.emit(
+                    False, prompt, str(job_dir), index, total
+                )
+
+        self.finished_batch.emit(stopped)
 
 
 class ShapeForge(QMainWindow):
@@ -83,7 +163,7 @@ class ShapeForge(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("ShapeForge - Local Text-to-3D")
-        self.resize(1200, 760)
+        self.resize(1200, 800)
 
         self.setStyleSheet("""
             QMainWindow, QWidget {
@@ -91,7 +171,7 @@ class ShapeForge(QMainWindow):
                 color: #e8eaf0;
                 font-size: 14px;
             }
-            QLineEdit, QTextEdit {
+            QTextEdit {
                 background: #151820;
                 border: 1px solid #414858;
                 border-radius: 7px;
@@ -112,6 +192,8 @@ class ShapeForge(QMainWindow):
 
         self.mesh_item = None
         self.worker = None
+        self.batch_worker = None
+        self.latest_output_dir = OUTPUT
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -134,18 +216,42 @@ class ShapeForge(QMainWindow):
         left = QWidget()
         left_layout = QVBoxLayout(left)
 
-        left_layout.addWidget(QLabel("Describe your 3D model"))
+        left_layout.addWidget(QLabel("Single Generation"))
 
         self.prompt = QTextEdit()
         self.prompt.setPlaceholderText(
-            "Example: A cute low-poly penguin with two eyes..."
+            "Describe one 3D model..."
         )
-        self.prompt.setMaximumHeight(145)
+        self.prompt.setMaximumHeight(90)
         left_layout.addWidget(self.prompt)
 
         self.generate_button = QPushButton("Generate 3D Model")
         self.generate_button.clicked.connect(self.generate)
         left_layout.addWidget(self.generate_button)
+
+        left_layout.addWidget(QLabel("Batch Build — up to 10 prompts"))
+        self.batch_prompts = QTextEdit()
+        self.batch_prompts.setPlaceholderText(
+            "One prompt per line:\n"
+            "A low-poly penguin\n"
+            "A medieval treasure chest\n"
+            "A small fantasy castle"
+        )
+        self.batch_prompts.setMaximumHeight(150)
+        left_layout.addWidget(self.batch_prompts)
+
+        batch_buttons = QHBoxLayout()
+
+        self.batch_button = QPushButton("Start Batch")
+        self.batch_button.clicked.connect(self.start_batch)
+
+        self.stop_button = QPushButton("Stop After Current")
+        self.stop_button.clicked.connect(self.stop_batch)
+        self.stop_button.setEnabled(False)
+
+        batch_buttons.addWidget(self.batch_button)
+        batch_buttons.addWidget(self.stop_button)
+        left_layout.addLayout(batch_buttons)
 
         left_layout.addWidget(QLabel("Generation log"))
 
@@ -165,7 +271,9 @@ class ShapeForge(QMainWindow):
 
         self.view = gl.GLViewWidget()
         self.view.setBackgroundColor("#171a22")
-        self.view.setCameraPosition(distance=4, elevation=20, azimuth=45)
+        self.view.setCameraPosition(
+            distance=4, elevation=20, azimuth=45
+        )
 
         grid = gl.GLGridItem()
         grid.setSize(4, 4)
@@ -177,17 +285,19 @@ class ShapeForge(QMainWindow):
         export_row = QHBoxLayout()
 
         self.obj_button = QPushButton("Export OBJ")
-        self.obj_button.clicked.connect(lambda: self.export("obj"))
+        self.obj_button.clicked.connect(
+            lambda: self.export("obj")
+        )
         self.obj_button.setEnabled(False)
 
         self.ply_button = QPushButton("Export PLY")
-        self.ply_button.clicked.connect(lambda: self.export("ply"))
+        self.ply_button.clicked.connect(
+            lambda: self.export("ply")
+        )
         self.ply_button.setEnabled(False)
 
         self.folder_button = QPushButton("Open Output Folder")
-        self.folder_button.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(OUTPUT)))
-        )
+        self.folder_button.clicked.connect(self.open_output_folder)
 
         export_row.addWidget(self.obj_button)
         export_row.addWidget(self.ply_button)
@@ -195,17 +305,25 @@ class ShapeForge(QMainWindow):
         right_layout.addLayout(export_row)
 
         splitter.addWidget(right)
-        splitter.setSizes([360, 840])
+        splitter.setSizes([390, 810])
 
         if not ENGINE.exists():
-            self.log.append(f"WARNING: Generator not found: {ENGINE}")
+            self.log.append(
+                f"WARNING: Generator not found: {ENGINE}"
+            )
+
+    def set_running(self, running):
+        self.generate_button.setEnabled(not running)
+        self.batch_button.setEnabled(not running)
+        self.stop_button.setEnabled(False)
 
     def generate(self):
         prompt = self.prompt.toPlainText().strip()
 
         if not prompt:
             QMessageBox.warning(
-                self, "Missing prompt", "Please describe an object first."
+                self, "Missing prompt",
+                "Please describe an object first."
             )
             return
 
@@ -216,35 +334,146 @@ class ShapeForge(QMainWindow):
             )
             return
 
-        self.generate_button.setEnabled(False)
+        self.set_running(True)
         self.obj_button.setEnabled(False)
         self.ply_button.setEnabled(False)
 
         self.log.clear()
-        self.log.append("Starting ShapeForge...")
+        self.log.append("Starting single generation...")
         self.status.setText("Generating on RTX 3060...")
 
-        self.worker = Generator(prompt)
+        self.latest_output_dir = OUTPUT
+        self.worker = Generator(prompt, OUTPUT)
         self.worker.log.connect(self.log.append)
-        self.worker.finished_generation.connect(self.generation_finished)
+        self.worker.finished_generation.connect(
+            self.generation_finished
+        )
         self.worker.start()
 
-    def generation_finished(self, success, message):
-        self.generate_button.setEnabled(True)
+    def start_batch(self):
+        prompts = [
+            line.strip()
+            for line in self.batch_prompts.toPlainText().splitlines()
+            if line.strip()
+        ]
+
+        if not prompts:
+            QMessageBox.warning(
+                self, "No prompts",
+                "Enter at least one prompt."
+            )
+            return
+
+        if len(prompts) > 10:
+            QMessageBox.warning(
+                self, "Too many prompts",
+                "Batch Build currently supports a maximum of 10 prompts."
+            )
+            return
+
+        if not ENGINE.exists():
+            QMessageBox.critical(
+                self, "Missing engine",
+                f"Could not find Shap-E generator:\n{ENGINE}"
+            )
+            return
+
+        batch_name = datetime.now().strftime(
+            "batch_%Y%m%d_%H%M%S"
+        )
+        batch_dir = BATCH_OUTPUT / batch_name
+
+        self.set_running(True)
+        self.stop_button.setEnabled(True)
+        self.obj_button.setEnabled(False)
+        self.ply_button.setEnabled(False)
+
+        self.log.clear()
+        self.log.append(
+            f"Starting batch with {len(prompts)} prompts."
+        )
+        self.log.append("Jobs will run sequentially.")
+
+        self.batch_worker = BatchGenerator(prompts, batch_dir)
+        self.batch_worker.log.connect(self.log.append)
+        self.batch_worker.job_finished.connect(
+            self.batch_job_finished
+        )
+        self.batch_worker.finished_batch.connect(
+            self.batch_finished
+        )
+        self.batch_worker.start()
+
+        self.status.setText(
+            f"Batch running • 0/{len(prompts)} completed"
+        )
+
+    def stop_batch(self):
+        if self.batch_worker and self.batch_worker.isRunning():
+            self.batch_worker.request_stop()
+            self.stop_button.setEnabled(False)
+            self.status.setText(
+                "Stop requested • finishing current generation..."
+            )
+            self.log.append(
+                "Stop requested. Current job will finish first."
+            )
+
+    def batch_job_finished(
+        self, success, prompt, output_dir, index, total
+    ):
+        self.status.setText(
+            f"Batch progress • Job {index}/{total} finished"
+        )
+
+        if success:
+            self.latest_output_dir = Path(output_dir)
+
+            try:
+                self.load_mesh(
+                    self.latest_output_dir / "generated.obj"
+                )
+                self.obj_button.setEnabled(True)
+                self.ply_button.setEnabled(True)
+            except Exception as error:
+                self.log.append(
+                    f"Preview error for job {index}: {error}"
+                )
+
+    def batch_finished(self, stopped):
+        self.set_running(False)
+
+        if stopped:
+            self.status.setText("Batch stopped.")
+            self.log.append("Batch stopped.")
+        else:
+            self.status.setText("Batch complete!")
+            self.log.append("All batch jobs have finished.")
+
+    def generation_finished(self, success, message, output_dir):
+        self.set_running(False)
         self.log.append(message)
 
         if success:
+            self.latest_output_dir = Path(output_dir)
+
             try:
-                self.load_mesh(OUTPUT / "generated.obj")
+                self.load_mesh(
+                    self.latest_output_dir / "generated.obj"
+                )
                 self.obj_button.setEnabled(True)
                 self.ply_button.setEnabled(True)
                 self.status.setText("Generation complete!")
             except Exception as error:
-                self.status.setText("Generated, but preview failed.")
+                self.status.setText(
+                    "Generated, but preview failed."
+                )
                 self.log.append(f"Preview error: {error}")
         else:
             self.status.setText("Generation failed.")
-            QMessageBox.warning(self, "Generation failed", message)
+            QMessageBox.warning(
+                self, "Generation failed", message
+            )
 
     def load_mesh(self, path):
         mesh = trimesh.load(str(path), force="mesh")
@@ -252,19 +481,23 @@ class ShapeForge(QMainWindow):
         if mesh.is_empty:
             raise ValueError("The generated mesh is empty.")
 
-        vertices = np.asarray(mesh.vertices, dtype=np.float32)
+        vertices = np.asarray(
+            mesh.vertices, dtype=np.float32
+        )
         faces = np.asarray(mesh.faces, dtype=np.int32)
 
-        # Center and normalize the mesh for preview
         vertices -= vertices.mean(axis=0)
         extent = np.max(np.ptp(vertices, axis=0))
+
         if extent > 0:
             vertices *= 2.0 / extent
 
         if self.mesh_item is not None:
             self.view.removeItem(self.mesh_item)
 
-        mesh_data = gl.MeshData(vertexes=vertices, faces=faces)
+        mesh_data = gl.MeshData(
+            vertexes=vertices, faces=faces
+        )
 
         self.mesh_item = gl.GLMeshItem(
             meshdata=mesh_data,
@@ -276,14 +509,19 @@ class ShapeForge(QMainWindow):
         )
 
         self.view.addItem(self.mesh_item)
-        self.view.setCameraPosition(distance=4, elevation=20, azimuth=45)
+        self.view.setCameraPosition(
+            distance=4, elevation=20, azimuth=45
+        )
 
     def export(self, extension):
-        source = OUTPUT / f"generated.{extension}"
+        source = (
+            self.latest_output_dir / f"generated.{extension}"
+        )
 
         if not source.exists():
             QMessageBox.warning(
-                self, "File missing", f"Could not find {source}"
+                self, "File missing",
+                f"Could not find {source}"
             )
             return
 
@@ -298,14 +536,26 @@ class ShapeForge(QMainWindow):
             shutil.copy2(source, destination)
             self.log.append(f"Exported: {destination}")
 
+    def open_output_folder(self):
+        BATCH_OUTPUT.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(BATCH_OUTPUT))
+        )
+
     def closeEvent(self, event):
-        if self.worker is not None and self.worker.isRunning():
+        workers = [self.worker, self.batch_worker]
+
+        if any(
+            worker is not None and worker.isRunning()
+            for worker in workers
+        ):
             QMessageBox.warning(
                 self, "Generation in progress",
                 "Wait for generation to finish before closing ShapeForge."
             )
             event.ignore()
             return
+
         event.accept()
 
 
