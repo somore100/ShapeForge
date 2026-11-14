@@ -10,12 +10,13 @@ import trimesh
 import numpy as np
 import pyqtgraph.opengl as gl
 
-from PySide6.QtCore import QThread, Signal, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QThread, Signal, QUrl, QSize, Qt
+from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QPushButton, QTextEdit,
-    QFileDialog, QMessageBox, QSplitter
+    QFileDialog, QMessageBox, QSplitter,
+    QListWidget, QListWidgetItem, QListView
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -63,6 +64,9 @@ def run_generator_oneshot(prompt, output_dir, log_signal):
 
 import atexit
 from engine.client import PersistentEngine
+from engine.batchtools import (
+    BATCH_HELP, parse_prompts, render_thumbnail, placeholder_image
+)
 
 ENGINE_PROC = PersistentEngine(SERVER, SHAPE_E_HOME)
 atexit.register(ENGINE_PROC.shutdown)
@@ -256,6 +260,11 @@ class ShapeForge(QMainWindow):
         )
         self.batch_prompts.setMaximumHeight(150)
         left_layout.addWidget(self.batch_prompts)
+        self.batch_prompts.setPlaceholderText(BATCH_HELP)
+        self.batch_count = QLabel()
+        left_layout.addWidget(self.batch_count)
+        self.batch_prompts.textChanged.connect(self.update_batch_count)
+        self.update_batch_count()
 
         batch_buttons = QHBoxLayout()
 
@@ -298,6 +307,25 @@ class ShapeForge(QMainWindow):
         self.view.addItem(grid)
 
         right_layout.addWidget(self.view, 1)
+        self.results = QListWidget()
+        self.results.setViewMode(QListView.IconMode)
+        self.results.setFlow(QListView.LeftToRight)
+        self.results.setWrapping(False)
+        self.results.setMovement(QListView.Static)
+        self.results.setIconSize(QSize(96, 96))
+        self.results.setGridSize(QSize(112, 134))
+        self.results.setSpacing(4)
+        self.results.setFixedHeight(156)
+        self.results.setHorizontalScrollMode(QListWidget.ScrollPerPixel)
+        self.results.setStyleSheet(
+            "QListWidget { background: #151820; border: 1px solid #414858;"
+            " border-radius: 7px; }"
+            "QListWidget::item { color: #e8eaf0; }"
+            "QListWidget::item:selected { background: #3478f6;"
+            " border-radius: 6px; }"
+        )
+        self.results.itemClicked.connect(self.result_clicked)
+        right_layout.addWidget(self.results)
 
         export_row = QHBoxLayout()
 
@@ -368,11 +396,7 @@ class ShapeForge(QMainWindow):
         self.worker.start()
 
     def start_batch(self):
-        prompts = [
-            line.strip()
-            for line in self.batch_prompts.toPlainText().splitlines()
-            if line.strip()
-        ]
+        prompts = parse_prompts(self.batch_prompts.toPlainText())
 
         if not prompts:
             QMessageBox.warning(
@@ -402,6 +426,7 @@ class ShapeForge(QMainWindow):
 
         self.set_running(True)
         self.stop_button.setEnabled(True)
+        self.results.clear()
         self.obj_button.setEnabled(False)
         self.ply_button.setEnabled(False)
 
@@ -425,6 +450,55 @@ class ShapeForge(QMainWindow):
             f"Batch running • 0/{len(prompts)} completed"
         )
 
+    def update_batch_count(self):
+        count = len(parse_prompts(self.batch_prompts.toPlainText()))
+        if count == 0:
+            text, color = "No prompts yet", "#8892a6"
+        elif count > 10:
+            text, color = (
+                f"{count} prompts detected - over the limit of 10", "#ff8a8a"
+            )
+        else:
+            noun = "prompt" if count == 1 else "prompts"
+            text, color = f"{count} {noun} detected (limit 10)", "#6ee7a0"
+        self.batch_count.setText(text)
+        self.batch_count.setStyleSheet(f"color: {color};")
+
+    def add_result_item(self, success, prompt, output_dir, index):
+        short = prompt if len(prompt) <= 13 else prompt[:12] + "..."
+        try:
+            if success:
+                image = render_thumbnail(
+                    Path(output_dir) / "generated.obj", 96
+                )
+            else:
+                image = placeholder_image(96)
+        except Exception:
+            image = placeholder_image(96, "?", "#33384a")
+
+        item = QListWidgetItem(
+            QIcon(QPixmap.fromImage(image)), f"{index:02d} {short}"
+        )
+        item.setToolTip(prompt if success else f"FAILED: {prompt}")
+        item.setData(Qt.UserRole, str(output_dir) if success else "")
+        self.results.addItem(item)
+        if success:
+            self.results.setCurrentItem(item)
+        self.results.scrollToItem(item)
+
+    def result_clicked(self, item):
+        directory = item.data(Qt.UserRole)
+        if not directory:
+            return
+        self.latest_output_dir = Path(directory)
+        try:
+            self.load_mesh(self.latest_output_dir / "generated.obj")
+            self.obj_button.setEnabled(True)
+            self.ply_button.setEnabled(True)
+            self.status.setText(f"Previewing: {item.toolTip()}")
+        except Exception as error:
+            self.log.append(f"Preview error: {error}")
+
     def stop_batch(self):
         if self.batch_worker and self.batch_worker.isRunning():
             self.batch_worker.request_stop()
@@ -439,6 +513,7 @@ class ShapeForge(QMainWindow):
     def batch_job_finished(
         self, success, prompt, output_dir, index, total
     ):
+        self.add_result_item(success, prompt, output_dir, index)
         self.status.setText(
             f"Batch progress • Job {index}/{total} finished"
         )
