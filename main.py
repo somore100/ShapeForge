@@ -9,6 +9,7 @@ from pathlib import Path
 import trimesh
 import numpy as np
 import pyqtgraph.opengl as gl
+from pyqtgraph import Vector
 
 from PySide6.QtCore import QThread, Signal, QUrl, QSize, Qt
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
@@ -16,7 +17,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QPushButton, QTextEdit,
     QFileDialog, QMessageBox, QSplitter,
-    QListWidget, QListWidgetItem, QListView
+    QListWidget, QListWidgetItem, QListView, QButtonGroup
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -27,6 +28,7 @@ SHAPE_E_HOME = Path(
 ENGINE = APP_DIR / "engine" / "generate.py"
 SERVER = APP_DIR / "engine" / "server.py"
 OUTPUT = APP_DIR / "generated"
+VIEW_MODES = ("Smooth", "Flat", "Wireframe", "Solid + Edges")
 BATCH_OUTPUT = APP_DIR / "outputs"
 
 
@@ -212,6 +214,9 @@ class ShapeForge(QMainWindow):
         """)
 
         self.mesh_item = None
+        self.mesh_vertices = None
+        self.mesh_faces = None
+        self.view_mode = "Smooth"
         self.worker = None
         self.batch_worker = None
         self.latest_output_dir = OUTPUT
@@ -307,6 +312,38 @@ class ShapeForge(QMainWindow):
         self.view.addItem(grid)
 
         right_layout.addWidget(self.view, 1)
+        mode_row = QHBoxLayout()
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        self.mode_buttons = {}
+        for name in VIEW_MODES:
+            button = QPushButton(name)
+            button.setCheckable(True)
+            button.setChecked(name == self.view_mode)
+            button.setStyleSheet(
+                "QPushButton { background: #2b3140; padding: 6px 10px; }"
+                "QPushButton:hover { background: #3a4256; }"
+                "QPushButton:checked { background: #3478f6; }"
+            )
+            button.clicked.connect(
+                lambda checked, mode=name: self.set_view_mode(mode)
+            )
+            self.mode_group.addButton(button)
+            self.mode_buttons[name] = button
+            mode_row.addWidget(button)
+        mode_row.addStretch(1)
+        reset_button = QPushButton("Reset Camera")
+        reset_button.setStyleSheet(
+            "QPushButton { background: #2b3140; padding: 6px 10px; }"
+            "QPushButton:hover { background: #3a4256; }"
+        )
+        reset_button.clicked.connect(self.reset_camera)
+        mode_row.addWidget(reset_button)
+        right_layout.addLayout(mode_row)
+
+        self.mesh_info = QLabel("No model loaded")
+        self.mesh_info.setStyleSheet("color: #8892a6;")
+        right_layout.addWidget(self.mesh_info)
         self.results = QListWidget()
         self.results.setViewMode(QListView.IconMode)
         self.results.setFlow(QListView.LeftToRight)
@@ -573,35 +610,73 @@ class ShapeForge(QMainWindow):
         if mesh.is_empty:
             raise ValueError("The generated mesh is empty.")
 
-        vertices = np.asarray(
-            mesh.vertices, dtype=np.float32
-        )
+        vertices = np.asarray(mesh.vertices, dtype=np.float32)
         faces = np.asarray(mesh.faces, dtype=np.int32)
 
-        vertices -= vertices.mean(axis=0)
-        extent = np.max(np.ptp(vertices, axis=0))
+        low = vertices.min(axis=0)
+        high = vertices.max(axis=0)
+        size = high - low
 
+        try:
+            closed = bool(mesh.is_watertight)
+        except Exception:
+            closed = False
+        self.mesh_info.setStyleSheet("color: #aab4c8;")
+        self.mesh_info.setText(
+            f"{len(faces):,} faces | {len(vertices):,} vertices | "
+            f"size {size[0]:.2f} x {size[1]:.2f} x {size[2]:.2f} | "
+            f"{'closed surface' if closed else 'open surface'}"
+        )
+
+        # Centre on the grid, scale to a 2-unit box, rest on the floor.
+        vertices -= (low + high) / 2
+        extent = float(np.max(size))
         if extent > 0:
             vertices *= 2.0 / extent
+        vertices[:, 2] -= vertices[:, 2].min()
+
+        self.mesh_vertices = vertices
+        self.mesh_faces = faces
+        self.show_mesh()
+        self.reset_camera()
+
+    def show_mesh(self):
+        if self.mesh_vertices is None:
+            return
 
         if self.mesh_item is not None:
             self.view.removeItem(self.mesh_item)
+            self.mesh_item = None
 
-        mesh_data = gl.MeshData(
-            vertexes=vertices, faces=faces
-        )
-
-        self.mesh_item = gl.GLMeshItem(
-            meshdata=mesh_data,
-            smooth=False,
-            drawFaces=True,
-            drawEdges=False,
+        mode = self.view_mode
+        options = dict(
+            meshdata=gl.MeshData(
+                vertexes=self.mesh_vertices, faces=self.mesh_faces
+            ),
+            smooth=(mode == "Smooth"),
+            drawFaces=(mode != "Wireframe"),
+            drawEdges=(mode in ("Wireframe", "Solid + Edges")),
             shader="shaded",
-            color=(0.72, 0.78, 0.92, 1.0)
+            color=(0.72, 0.78, 0.92, 1.0),
         )
+        if mode == "Wireframe":
+            options["edgeColor"] = (0.55, 0.78, 1.0, 1.0)
+        elif mode == "Solid + Edges":
+            options["edgeColor"] = (0.10, 0.12, 0.17, 1.0)
 
+        self.mesh_item = gl.GLMeshItem(**options)
         self.view.addItem(self.mesh_item)
+
+    def set_view_mode(self, mode):
+        self.view_mode = mode
+        self.show_mesh()
+
+    def reset_camera(self):
+        height = 0.0
+        if self.mesh_vertices is not None:
+            height = float(self.mesh_vertices[:, 2].max())
         self.view.setCameraPosition(
+            pos=Vector(0, 0, height / 2),
             distance=4, elevation=20, azimuth=45
         )
 
