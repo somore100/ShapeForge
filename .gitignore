@@ -25,3 +25,5 @@ models/
 shap_e_model_cache/
 main_before_*.py
 main_v01_backup.py
+apply_v0*.py
+main_before_*.py
