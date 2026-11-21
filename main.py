@@ -69,6 +69,8 @@ from engine.client import PersistentEngine
 from engine.batchtools import (
     BATCH_HELP, parse_prompts, render_thumbnail, placeholder_image
 )
+from engine.enhance_ui import EnhanceMixin
+from engine.cleanup_ui import CleanupMixin, best_mesh, purge_clean_files
 
 ENGINE_PROC = PersistentEngine(SERVER, SHAPE_E_HOME)
 atexit.register(ENGINE_PROC.shutdown)
@@ -181,7 +183,7 @@ class BatchGenerator(QThread):
         self.finished_batch.emit(stopped)
 
 
-class ShapeForge(QMainWindow):
+class ShapeForge(CleanupMixin, EnhanceMixin, QMainWindow):
     def __init__(self):
         super().__init__()
 
@@ -254,6 +256,7 @@ class ShapeForge(QMainWindow):
         self.generate_button = QPushButton("Generate 3D Model")
         self.generate_button.clicked.connect(self.generate)
         left_layout.addWidget(self.generate_button)
+        self.build_enhance_ui(left_layout)
 
         left_layout.addWidget(QLabel("Batch Build — up to 10 prompts"))
         self.batch_prompts = QTextEdit()
@@ -344,6 +347,7 @@ class ShapeForge(QMainWindow):
         self.mesh_info = QLabel("No model loaded")
         self.mesh_info.setStyleSheet("color: #8892a6;")
         right_layout.addWidget(self.mesh_info)
+        self.build_cleanup_ui(right_layout)
         self.results = QListWidget()
         self.results.setViewMode(QListView.IconMode)
         self.results.setFlow(QListView.LeftToRight)
@@ -383,6 +387,7 @@ class ShapeForge(QMainWindow):
 
         export_row.addWidget(self.obj_button)
         export_row.addWidget(self.ply_button)
+        self.add_extra_export_buttons(export_row)
         export_row.addWidget(self.folder_button)
         right_layout.addLayout(export_row)
 
@@ -398,6 +403,7 @@ class ShapeForge(QMainWindow):
         self.generate_button.setEnabled(not running)
         self.batch_button.setEnabled(not running)
         self.stop_button.setEnabled(False)
+        self.enhance_generating(running)
 
     def generate(self):
         prompt = self.prompt.toPlainText().strip()
@@ -424,6 +430,7 @@ class ShapeForge(QMainWindow):
         self.log.append("Starting single generation...")
         self.status.setText("Generating on RTX 3060...")
 
+        purge_clean_files(OUTPUT)
         self.latest_output_dir = OUTPUT
         self.worker = Generator(prompt, OUTPUT)
         self.worker.log.connect(self.log.append)
@@ -505,9 +512,7 @@ class ShapeForge(QMainWindow):
         short = prompt if len(prompt) <= 13 else prompt[:12] + "..."
         try:
             if success:
-                image = render_thumbnail(
-                    Path(output_dir) / "generated.obj", 96
-                )
+                image = render_thumbnail(best_mesh(output_dir), 96)
             else:
                 image = placeholder_image(96)
         except Exception:
@@ -529,7 +534,7 @@ class ShapeForge(QMainWindow):
             return
         self.latest_output_dir = Path(directory)
         try:
-            self.load_mesh(self.latest_output_dir / "generated.obj")
+            self.load_mesh(best_mesh(self.latest_output_dir))
             self.obj_button.setEnabled(True)
             self.ply_button.setEnabled(True)
             self.status.setText(f"Previewing: {item.toolTip()}")
@@ -550,6 +555,7 @@ class ShapeForge(QMainWindow):
     def batch_job_finished(
         self, success, prompt, output_dir, index, total
     ):
+        self.auto_clean_job(success, output_dir, index)
         self.add_result_item(success, prompt, output_dir, index)
         self.status.setText(
             f"Batch progress • Job {index}/{total} finished"
@@ -559,9 +565,7 @@ class ShapeForge(QMainWindow):
             self.latest_output_dir = Path(output_dir)
 
             try:
-                self.load_mesh(
-                    self.latest_output_dir / "generated.obj"
-                )
+                self.load_mesh(best_mesh(self.latest_output_dir))
                 self.obj_button.setEnabled(True)
                 self.ply_button.setEnabled(True)
             except Exception as error:
@@ -639,6 +643,7 @@ class ShapeForge(QMainWindow):
         self.mesh_faces = faces
         self.show_mesh()
         self.reset_camera()
+        self.mesh_loaded(path)
 
     def show_mesh(self):
         if self.mesh_vertices is None:
@@ -680,29 +685,6 @@ class ShapeForge(QMainWindow):
             distance=4, elevation=20, azimuth=45
         )
 
-    def export(self, extension):
-        source = (
-            self.latest_output_dir / f"generated.{extension}"
-        )
-
-        if not source.exists():
-            QMessageBox.warning(
-                self, "File missing",
-                f"Could not find {source}"
-            )
-            return
-
-        destination, _ = QFileDialog.getSaveFileName(
-            self,
-            f"Export {extension.upper()}",
-            f"my_model.{extension}",
-            f"{extension.upper()} files (*.{extension})"
-        )
-
-        if destination:
-            shutil.copy2(source, destination)
-            self.log.append(f"Exported: {destination}")
-
     def open_output_folder(self):
         BATCH_OUTPUT.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(
@@ -723,6 +705,8 @@ class ShapeForge(QMainWindow):
             event.ignore()
             return
 
+        self.shutdown_cleanup()
+        self.shutdown_enhance()
         ENGINE_PROC.shutdown()
         event.accept()
 

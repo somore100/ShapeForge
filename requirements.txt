@@ -3,3 +3,4 @@ pyqtgraph>=0.13
 PyOpenGL>=3.1
 trimesh>=4.0
 numpy>=1.25
+scipy>=1.10
