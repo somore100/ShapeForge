@@ -29,3 +29,9 @@ apply_v0*.py
 main_before_*.py
 backups_v07/
 backups_v08/
+dist/
+build/
+AppDir/
+*.AppImage
+smoke.json
+backups_v09/

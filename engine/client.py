@@ -12,6 +12,8 @@ import subprocess
 import sys
 import threading
 
+from engine.runtime import engine_python
+
 _PERCENT = re.compile(r"^\s*(\d+)%\|")
 
 
@@ -66,7 +68,7 @@ class PersistentEngine:
         env["PYTHONPATH"] = self.home + (os.pathsep + prior if prior else "")
         env["SHAPE_E_HOME"] = self.home
         self.proc = subprocess.Popen(
-            [sys.executable, self.server_path],
+            [engine_python(), self.server_path],
             cwd=self.home, env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1,

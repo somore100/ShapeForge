@@ -1,0 +1,153 @@
+name: Build
+
+# Builds ShapeForge for Linux (AppImage), Windows (zip) and macOS (dmg).
+# Run it by hand (Actions tab > Build > Run workflow) to get test builds as
+# artifacts, or push a tag such as v0.9.0 to also create a draft GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SHAPEFORGE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.run_number) }}
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Oldest supported Ubuntu = widest glibc compatibility for the AppImage.
+          - { name: linux-x86_64,  os: ubuntu-22.04,    experimental: false }
+          - { name: windows-x64,   os: windows-latest,  experimental: false }
+          - { name: macos-arm64,   os: macos-latest,    experimental: false }
+          - { name: macos-x86_64,  os: macos-15-intel,  experimental: true }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 libxkbcommon0 libxkbcommon-x11-0 \
+            libdbus-1-3 libfontconfig1 libglib2.0-0 libxcb-cursor0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pillow
+          pip install fast-simplification || echo "fast-simplification unavailable: decimation disabled"
+
+      - name: Build app
+        shell: bash
+        run: pyinstaller --noconfirm packaging/shapeforge.spec
+
+      # ---- Linux: AppImage ------------------------------------------------
+      - name: Package AppImage
+        if: runner.os == 'Linux'
+        run: |
+          rm -rf AppDir && mkdir -p AppDir/usr/bin AppDir/usr/lib
+          cp -r dist/ShapeForge AppDir/usr/bin/
+          install -m 755 packaging/appimage/AppRun AppDir/AppRun
+          cp packaging/appimage/shapeforge.desktop AppDir/shapeforge.desktop
+          cp assets/icon.png AppDir/shapeforge.png
+          # Qt's xcb platform plugin needs these; many desktops do not ship them.
+          for lib in libxcb-cursor libxcb-icccm libxcb-image libxcb-keysyms \
+                     libxcb-render-util libxcb-xinerama libxcb-xkb libxkbcommon-x11; do
+            for f in /usr/lib/x86_64-linux-gnu/$lib.so*; do
+              [ -e "$f" ] && cp -P "$f" AppDir/usr/lib/ || true
+            done
+          done
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir \
+            "ShapeForge-${SHAPEFORGE_VERSION}-linux-x86_64.AppImage"
+          echo "ARTIFACT=ShapeForge-${SHAPEFORGE_VERSION}-linux-x86_64.AppImage" >> "$GITHUB_ENV"
+
+      - name: Smoke test (AppImage)
+        if: runner.os == 'Linux'
+        env:
+          QT_QPA_PLATFORM: offscreen
+          SHAPEFORGE_SMOKETEST: ${{ github.workspace }}/smoke.json
+        run: |
+          chmod +x "$ARTIFACT"
+          "./$ARTIFACT" --appimage-extract-and-run
+          python -c "import json; d=json.load(open('smoke.json')); print(d); assert d['ok'] and d['frozen'] and d['engine_files']"
+
+      # ---- Windows: zip ---------------------------------------------------
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+          SHAPEFORGE_SMOKETEST: ${{ github.workspace }}\smoke.json
+        run: |
+          Start-Process -FilePath dist\ShapeForge\ShapeForge.exe -Wait
+          python -c "import json; d=json.load(open('smoke.json')); print(d); assert d['ok'] and d['frozen'] and d['engine_files']"
+
+      - name: Package zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "ShapeForge-$env:SHAPEFORGE_VERSION-windows-x64.zip"
+          Compress-Archive -Path dist\ShapeForge -DestinationPath $name
+          "ARTIFACT=$name" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ---- macOS: dmg -----------------------------------------------------
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
+        env:
+          QT_QPA_PLATFORM: offscreen
+          SHAPEFORGE_SMOKETEST: ${{ github.workspace }}/smoke.json
+        run: |
+          dist/ShapeForge.app/Contents/MacOS/ShapeForge
+          python -c "import json; d=json.load(open('smoke.json')); print(d); assert d['ok'] and d['frozen'] and d['engine_files']"
+
+      - name: Package dmg
+        if: runner.os == 'macOS'
+        run: |
+          # Ad-hoc signature: Apple Silicon refuses to run unsigned binaries.
+          codesign --force --deep --sign - dist/ShapeForge.app
+          name="ShapeForge-${SHAPEFORGE_VERSION}-${{ matrix.name }}.dmg"
+          hdiutil create -volname ShapeForge -srcfolder dist/ShapeForge.app -ov -format UDZO "$name"
+          echo "ARTIFACT=$name" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ShapeForge-${{ matrix.name }}
+          path: ${{ env.ARTIFACT }}
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: release-files
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: release-files/*
+          draft: true
+          generate_release_notes: true

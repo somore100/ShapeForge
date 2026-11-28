@@ -20,20 +20,21 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QListView, QButtonGroup
 )
 
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 from engine.engine_setup import resolve_home
+from engine.runtime import engine_python, output_root
 SHAPE_E_HOME = resolve_home()
 
 ENGINE = APP_DIR / "engine" / "generate.py"
 SERVER = APP_DIR / "engine" / "server.py"
-OUTPUT = APP_DIR / "generated"
+OUTPUT = output_root() / "generated"
 VIEW_MODES = ("Smooth", "Flat", "Wireframe", "Solid + Edges")
-BATCH_OUTPUT = APP_DIR / "outputs"
+BATCH_OUTPUT = output_root() / "outputs"
 
 
 def run_generator_oneshot(prompt, output_dir, log_signal):
     command = [
-        sys.executable,
+        engine_python(),
         str(ENGINE),
         "--prompt", prompt,
         "--output", str(output_dir)
@@ -724,4 +725,14 @@ if __name__ == "__main__":
     install_engine_ui(window, ENGINE_PROC)
     window.show()
     fit_window(window)
+    smoke = os.environ.get("SHAPEFORGE_SMOKETEST")
+    if smoke:  # CI check: the packaged app starts and finds its engine files
+        import json
+        files = ("server.py", "generate.py", "colorspace.py")
+        Path(smoke).write_text(json.dumps({
+            "ok": True, "frozen": bool(getattr(sys, "frozen", False)),
+            "engine_files": all((APP_DIR / "engine" / f).exists() for f in files),
+            "engine_python": engine_python(),
+        }))
+        sys.exit(0)
     sys.exit(app.exec())

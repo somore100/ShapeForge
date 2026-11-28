@@ -5,8 +5,10 @@ engine then runs on the CPU, which is slow but works)."""
 import importlib.util
 import json
 import os
+import platform
 import re
 import shutil
+import tarfile
 import subprocess
 import sys
 import tempfile
@@ -22,10 +24,15 @@ from PySide6.QtWidgets import (
 )
 
 from engine.enhance_ui import BUTTON_STYLE, COMBO_STYLE
+from engine.runtime import (  # noqa: F401
+    app_data_dir, engine_python, is_frozen, uses_managed_python, venv_dir,
+)
 
 REPO_ZIP_URL = "https://github.com/openai/shap-e/archive/refs/heads/main.zip"
 CLIP_ZIP_URL = "https://github.com/openai/CLIP/archive/refs/heads/main.zip"
 CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+UV_URL = "https://github.com/astral-sh/uv/releases/latest/download/"
+ENGINE_PYTHON_VERSION = "3.12"
 
 # import name -> pip name (None = special handling)
 REQUIRED = {
@@ -58,16 +65,6 @@ PRESET_HELP = (
 
 # ----------------------------------------------------------- locations --
 
-def app_data_dir():
-    if sys.platform.startswith("win"):
-        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-    elif sys.platform == "darwin":
-        base = Path.home() / "Library" / "Application Support"
-    else:
-        base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
-    return base / "ShapeForge"
-
-
 def repo_ok(home):
     return (Path(home) / "shap_e" / "__init__.py").exists()
 
@@ -87,8 +84,24 @@ def has_nvidia():
     return shutil.which("nvidia-smi") is not None
 
 
+def missing_modules(python=None):
+    python = python or engine_python()
+    if os.path.abspath(python) == os.path.abspath(sys.executable):
+        return [m for m in REQUIRED if importlib.util.find_spec(m) is None]
+    if not os.path.exists(python):
+        return list(REQUIRED)
+    code = ("import importlib.util, json; print(json.dumps([m for m in "
+            f"{list(REQUIRED)!r} if importlib.util.find_spec(m) is None]))")
+    try:
+        out = subprocess.run([python, "-c", code], capture_output=True,
+                             text=True, timeout=60).stdout
+        return json.loads(out.strip().splitlines()[-1])
+    except Exception:
+        return list(REQUIRED)
+
+
 def quick_status(home):
-    missing = [m for m in REQUIRED if importlib.util.find_spec(m) is None]
+    missing = missing_modules()
     repo = repo_ok(home)
     return {"repo": repo, "missing": missing, "ready": repo and not missing}
 
@@ -99,13 +112,15 @@ def default_preset():
 
 # ---------------------------------------------------------------- plan --
 
-def pip_plan(missing, nvidia, platform):
+def pip_plan(missing, nvidia, platform, uv=False):
     """-> list of pip argument lists, in install order."""
     plan = []
     torch_pkgs = [m for m in ("torch", "torchvision") if m in missing]
     if torch_pkgs:
         args = list(torch_pkgs)
-        if platform.startswith("linux") and not nvidia:
+        if uv:
+            args += ["--torch-backend", "auto"]  # CUDA, ROCm or CPU as fits
+        elif platform.startswith("linux") and not nvidia:
             args += ["--index-url", CPU_INDEX]  # small CPU-only build
         plan.append(args)
     others = [REQUIRED[m] for m in missing if REQUIRED.get(m)]
@@ -128,9 +143,11 @@ class SetupTask(QThread):
     line = Signal(str)
     finished_setup = Signal(bool, str, str)  # ok, message, device
 
-    def __init__(self, home, pip_runner=None, verify_runner=None):
+    def __init__(self, home, pip_runner=None, verify_runner=None, uv_mode=None):
         super().__init__()
         self.home = Path(home)
+        self.uv_mode = uses_managed_python() if uv_mode is None else uv_mode
+        self.uv = None
         self._cancel = False
         self._proc = None
         self._pip = pip_runner or self._run_pip
@@ -148,6 +165,7 @@ class SetupTask(QThread):
     def run(self):
         try:
             self._download_repo()
+            self._ensure_python()
             self._install_libraries()
             device = self._verify_import()
             note = ("NVIDIA GPU found: generation will use it." if device == "cuda"
@@ -208,14 +226,70 @@ class SetupTask(QThread):
                     self.line.emit(f"  downloaded {done / 1e6:.1f} MB"
                                    + (f" ({done * 100 // total}%)" if total else ""))
 
+    def _ensure_python(self):
+        """Packaged app: create the engine's own Python (via uv) once."""
+        if not self.uv_mode:
+            return
+        self.uv = self._ensure_uv()
+        python = engine_python()
+        if os.path.exists(python):
+            self.line.emit("Engine Python already present.")
+            return
+        self.line.emit(f"Creating engine Python {ENGINE_PYTHON_VERSION} (one time) ...")
+        code, output = self._stream([self.uv, "venv", "--python", ENGINE_PYTHON_VERSION,
+                                     str(venv_dir())])
+        if code != 0 or not os.path.exists(python):
+            tail = "\n".join(output.strip().splitlines()[-5:])
+            raise RuntimeError("Could not create the engine's Python:\n" + tail)
+
+    def _ensure_uv(self):
+        target = app_data_dir() / "tools" / ("uv.exe" if sys.platform.startswith("win") else "uv")
+        if target.exists():
+            return str(target)
+        machine = platform.machine().lower()
+        arch = "aarch64" if machine in ("arm64", "aarch64") else "x86_64"
+        if sys.platform.startswith("win"):
+            asset = f"uv-{arch}-pc-windows-msvc.zip"
+        elif sys.platform == "darwin":
+            asset = f"uv-{arch}-apple-darwin.tar.gz"
+        else:
+            asset = f"uv-{arch}-unknown-linux-gnu.tar.gz"
+        self.line.emit("Downloading the uv installer tool ...")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / asset
+            try:
+                self._fetch(UV_URL + asset, archive)
+            except OSError as error:
+                raise RuntimeError(f"Could not download uv ({error}). "
+                                   "Check your internet connection.") from error
+            wanted = target.name
+            if asset.endswith(".zip"):
+                with zipfile.ZipFile(archive) as zf:
+                    name = next((n for n in zf.namelist() if Path(n).name == wanted), None)
+                    if name is None:
+                        raise RuntimeError("uv download did not contain uv.")
+                    with zf.open(name) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+            else:
+                with tarfile.open(archive) as tf:
+                    member = next((m for m in tf.getmembers()
+                                   if m.isfile() and Path(m.name).name == wanted), None)
+                    if member is None:
+                        raise RuntimeError("uv download did not contain uv.")
+                    with tf.extractfile(member) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+        target.chmod(0o755)
+        return str(target)
+
     def _install_libraries(self):
         status = quick_status(self.home)
-        plan = pip_plan(status["missing"], has_nvidia(), sys.platform)
+        plan = pip_plan(status["missing"], has_nvidia(), sys.platform, uv=self.uv_mode)
         if not plan:
             self.line.emit("Python libraries already installed.")
         for args in plan:
             self._check_cancel()
-            self.line.emit("pip install " + " ".join(args))
+            self.line.emit(("uv pip install " if self.uv_mode else "pip install ") + " ".join(args))
             code, output = self._pip(args)
             if code != 0:
                 raise RuntimeError(self._explain_pip_failure(args, output))
@@ -256,13 +330,15 @@ class SetupTask(QThread):
         return code, "\n".join(lines)
 
     def _run_pip(self, args):
-        return self._stream([sys.executable, "-m", "pip", "install",
+        if self.uv_mode:
+            return self._stream([self.uv, "pip", "install", "--python", engine_python(), *args])
+        return self._stream([engine_python(), "-m", "pip", "install",
                              "--disable-pip-version-check", "--progress-bar", "off", *args])
 
     def _run_verify(self):
         env = os.environ.copy()
         env["PYTHONPATH"] = str(self.home) + os.pathsep + env.get("PYTHONPATH", "")
-        return self._stream([sys.executable, "-c", VERIFY], env=env,
+        return self._stream([engine_python(), "-c", VERIFY], env=env,
                             cwd=str(self.home), quiet=True)
 
     @staticmethod
@@ -273,7 +349,8 @@ class SetupTask(QThread):
             return ("Your system Python does not allow installing packages. Run "
                     "ShapeForge inside a virtual environment: "
                     "python3 -m venv .venv && source .venv/bin/activate")
-        if "no matching distribution" in low or "could not find a version" in low:
+        if ("no matching distribution" in low or "could not find a version" in low
+                or "no solution found" in low or "no version of" in low):
             return (f"No build of {args[0]} is available for Python {version} on "
                     "this system yet. Use Python 3.10-3.12 (for example "
                     "'uv venv --python 3.12') and run ShapeForge there.")
@@ -331,7 +408,10 @@ class SetupDialog(QDialog):
             f"{hardware}<br><br>"
             "Downloading installs the Shap-E code (small), the missing Python "
             "libraries (PyTorch is large: about 200 MB CPU-only, 2 GB+ with CUDA) "
-            "and, the first time you generate, the AI models (about 3 GB).")
+            "and, the first time you generate, the AI models (about 3 GB)."
+            + ("<br><br>This app keeps the engine in its own private Python "
+               "environment, so nothing is installed system-wide."
+               if uses_managed_python() else ""))
         self.go.setEnabled(not status["ready"] and self.task is None)
         if status["ready"]:
             self.go.setText("Engine is installed")

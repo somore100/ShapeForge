@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ShapeForge
+Comment=Local AI text-to-3D asset generation
+Exec=ShapeForge
+Icon=shapeforge
+Categories=Graphics;3DGraphics;
+Terminal=false
