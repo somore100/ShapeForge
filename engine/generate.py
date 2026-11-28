@@ -52,6 +52,13 @@ def main():
 
     print("Converting generated shape into a mesh...")
     mesh = decode_latent_mesh(xm, latents[0]).tri_mesh()
+    try:  # Shap-E colours are linear; OBJ/PLY viewers expect sRGB
+        import pathlib as _pl, sys as _sys
+        _sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
+        from colorspace import mesh_colors_to_srgb
+        mesh_colors_to_srgb(mesh)
+    except Exception as error:  # never block a generation over colours
+        print(f"Colour conversion skipped: {error}")
 
     obj_path = output_dir / "generated.obj"
     ply_path = output_dir / "generated.ply"

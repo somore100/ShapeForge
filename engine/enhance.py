@@ -1,6 +1,6 @@
 """Prompt enhancement for ShapeForge: offline polish + optional local Ollama rewrite.
 
-Pure helpers (basic_polish, split/join batch lines, model filtering) have no
+Pure helpers (rule-based polish, split/join batch lines, model filtering) have no
 Qt dependency. EnhanceTask (QThread) wraps the Ollama calls for the UI.
 Only the standard library is used for HTTP, with proxies bypassed.
 """
@@ -14,26 +14,21 @@ from urllib.parse import urlparse
 
 from PySide6.QtCore import QThread, Signal
 
+from engine.rules import RULES_LABEL, STYLES, rule_enhance  # noqa: F401
+
 DEFAULT_MODEL = "llama3.1:8b"
 MAX_MODEL_BYTES = int(6.5e9)
 KEEP_ALIVE = "30s"
 
-STYLES = {
-    "None": "",
-    "Low-poly": "low-poly, flat colors",
-    "Cartoon": "stylized cartoon look, bold simple shapes",
-    "Realistic": "realistic proportions and materials",
-    "Game asset": "clean game-ready asset",
-    "Toy": "chunky toy-like, smooth rounded shapes",
-}
-
 SYSTEM_PROMPT = (
     "You rewrite short descriptions into prompts for Shap-E, a text-to-3D "
-    "model. Shap-E works best with one concrete object described briefly. "
-    "Rules: describe exactly one object; keep the user's subject; add only "
-    "useful shape, material and colour details; no scene, background, "
-    "people unless asked, text or logos; at most 20 words; one line. "
-    "Work any requested style in naturally. Reply with the prompt only."
+    "model. Shap-E works best with one simple, concrete object. Rules: keep "
+    "the user's subject and every detail they gave; do not invent colours, "
+    "brands, accessories or styling they did not ask for; if the object has "
+    "parts that make it recognisable (wheels, legs, wings, handle), mention "
+    "them briefly; describe one object only, with no scene, background, "
+    "lighting or people; at most 12 words; one line. Work any requested "
+    "style in naturally. Reply with the prompt only."
 )
 
 _REJECT_TOKENS = {
@@ -54,17 +49,8 @@ class OllamaError(Exception):
 # ---------------------------------------------------------------- polish --
 
 def basic_polish(text, style="None"):
-    """Offline cleanup: whitespace, quotes, trailing dot, optional style hint."""
-    text = re.sub(r"\s+", " ", text or "").strip()
-    if len(text) >= 2 and text[0] in _QUOTES and text[-1] in _QUOTES:
-        text = text[1:-1].strip()
-    text = text.rstrip(" .;")
-    if text:
-        text = text[0].upper() + text[1:]
-    hint = STYLES.get(style, "")
-    if text and hint and hint.lower() not in text.lower():
-        text = f"{text}, {hint}"
-    return text
+    """Offline, rule-based cleanup (see engine/rules.py)."""
+    return rule_enhance(text, style)
 
 
 def clean_reply(reply, fallback):

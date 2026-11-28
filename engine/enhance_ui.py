@@ -68,7 +68,10 @@ class EnhanceMixin:
         self.enh_style.addItems(list(core.STYLES))
         self.enh_style.setToolTip("Style added to enhanced prompts")
         self.enh_model = QComboBox()
-        self.enh_model.setToolTip("Local Ollama model used for rewriting")
+        self.enh_model.addItem(core.RULES_LABEL)
+        self.enh_model.currentTextChanged.connect(self._show_choice_status)
+        self._enh_user_pick = False
+        self.enh_model.activated.connect(lambda *_: setattr(self, "_enh_user_pick", True))
         for combo in (self.enh_style, self.enh_model):
             combo.setStyleSheet(COMBO_STYLE)
             pickers.addWidget(combo, 1)
@@ -100,7 +103,7 @@ class EnhanceMixin:
         self.enh_batch_button.setEnabled(idle)
         self.enh_action.setEnabled(not self._enh_busy)
         self.enh_style.setEnabled(idle)
-        self.enh_model.setEnabled(idle and self._enh_state == "ready")
+        self.enh_model.setEnabled(idle)
         self.enh_action.setText({
             "no_server": "Set up AI", "no_model": "Get model",
         }.get(self._enh_state, "Refresh"))
@@ -159,19 +162,29 @@ class EnhanceMixin:
     def _apply_probe(self, info):
         self._enh_state = info["state"]
         current = self.enh_model.currentText()
+        choices = [core.RULES_LABEL] + list(info["models"])
+        self.enh_model.blockSignals(True)
         self.enh_model.clear()
-        if info["state"] == "ready":
-            self.enh_model.addItems(info["models"])
-            pick = current if current in info["models"] else info["models"][0]
-            self.enh_model.setCurrentText(pick)
-            self._set_enh_status(f"AI ready: {pick}", "#6ee7a0")
-        elif info["state"] == "no_model":
-            self._set_enh_status(
-                f"Ollama is running but has no small chat model. "
-                f"Get {core.DEFAULT_MODEL} (about 5 GB).", "#f0c674")
+        self.enh_model.addItems(choices)
+        if info["state"] == "ready" and (not self._enh_user_pick or current not in choices):
+            pick = info["models"][0]
         else:
-            self._set_enh_status(
-                "Ollama not found - basic cleanup only.", "#f0c674")
+            pick = current if current in choices else core.RULES_LABEL
+        self.enh_model.setCurrentText(pick)
+        self.enh_model.blockSignals(False)
+        self._show_choice_status()
+
+    def _show_choice_status(self, *_):
+        choice = self.enh_model.currentText()
+        if choice and choice != core.RULES_LABEL:
+            self._set_enh_status(f"AI ready: {choice}", "#6ee7a0")
+            return
+        extra = {
+            "no_server": " - Ollama not found (optional)",
+            "no_model": " - optional: Get model for AI rewrites",
+            "ready": " - or pick an AI model",
+        }.get(self._enh_state, "")
+        self._set_enh_status("Rules mode (no AI)" + extra, "#6ee7a0")
 
     def enhance_action(self):
         if self._enh_state == "no_server":
@@ -215,13 +228,14 @@ class EnhanceMixin:
             return
         style = self.enh_style.currentText()
         self._enh_pending = (edit, entries, bodies, style)
-        if self._enh_state == "ready" and self.enh_model.currentText():
+        choice = self.enh_model.currentText()
+        if self._enh_state == "ready" and choice and choice != core.RULES_LABEL:
             self._set_enh_status("Enhancing...", "#aab4c8")
             self._start_enh_task("rewrite", model=self.enh_model.currentText(),
                                  items=bodies, style=style)
         else:
             self._finish_enhance([core.basic_polish(b, style) for b in bodies],
-                                 "basic cleanup (no AI model available)")
+                                 "rules (no AI)")
 
     def _apply_rewrite(self, ok, result):
         edit, entries, bodies, style = self._enh_pending
@@ -230,7 +244,7 @@ class EnhanceMixin:
         else:
             self.log.append(f"Enhance failed: {result}")
             self._finish_enhance([core.basic_polish(b, style) for b in bodies],
-                                 "basic cleanup (AI request failed)")
+                                 "rules (AI request failed)")
             self.enhance_probe()
 
     def _finish_enhance(self, new_bodies, how):
@@ -241,8 +255,7 @@ class EnhanceMixin:
             _replace_text(edit, core.join_batch_lines(entries, new_bodies))
         self.log.append(f"Enhanced {len(new_bodies)} prompt(s) with {how}. "
                         "Ctrl+Z in the box undoes it.")
-        if self._enh_state == "ready":
-            self._set_enh_status(f"AI ready: {self.enh_model.currentText()}", "#6ee7a0")
+        self._show_choice_status()
 
     # ----------------------------------------------------------- shutdown --
 
@@ -253,5 +266,5 @@ class EnhanceMixin:
             task.wait(1500)
         if getattr(self, "_enh_state", "") == "ready":
             model = self.enh_model.currentText()
-            if model:
+            if model and model != core.RULES_LABEL:
                 core.unload(self._enh_host, model)

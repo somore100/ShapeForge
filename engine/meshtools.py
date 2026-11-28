@@ -171,4 +171,10 @@ def export_mesh(source, destination, orientation="auto"):
     mesh = trimesh.load(str(source), force="mesh")
     if orientation == "yup" or (orientation == "auto" and extension == "glb"):
         mesh.apply_transform(Z_UP_TO_Y_UP)
+    if extension == "glb":  # glTF vertex colours are linear
+        try:
+            from engine.colorspace import trimesh_colors_srgb_to_linear
+            trimesh_colors_srgb_to_linear(mesh)
+        except Exception:
+            pass
     mesh.export(str(destination))

@@ -24,6 +24,7 @@ class PersistentEngine:
         self._log = lambda text: None
         self._last_percent = -1
         self._job_id = 0
+        self.options = {}  # quality settings merged into every job
 
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
@@ -102,6 +103,7 @@ class PersistentEngine:
             self._job_id += 1
             job_id = self._job_id
             job = {"id": job_id, "prompt": prompt, "output": str(output_dir)}
+            job.update(self.options)
             try:
                 self.proc.stdin.write(json.dumps(job) + "\n")
                 self.proc.stdin.flush()

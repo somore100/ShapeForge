@@ -67,7 +67,9 @@ def load_engine():
     return torch, device, xm, model, diffusion
 
 
-def generate(engine, prompt, output_dir):
+def generate(engine, prompt, output_dir, steps=64, grid=128):
+    steps = max(8, min(int(steps), 128))
+    grid = max(32, min(int(grid), 256))
     torch, device, xm, model, diffusion = engine
 
     from shap_e.diffusion.sample import sample_latents
@@ -89,13 +91,25 @@ def generate(engine, prompt, output_dir):
         clip_denoised=True,
         use_fp16=(device.type == "cuda"),
         use_karras=True,
-        karras_steps=64,
+        karras_steps=steps,
         sigma_min=1e-3,
         sigma_max=160,
         s_churn=0,
     )
 
+    try:  # mesh resolution (Quality preset)
+        xm.renderer.grid_size = grid
+    except Exception as error:
+        log(f"Could not set mesh resolution: {error}")
+    log(f"Quality: {steps} steps, mesh grid {grid}")
     mesh = decode_latent_mesh(xm, latents[0]).tri_mesh()
+    try:  # Shap-E colours are linear; OBJ/PLY viewers expect sRGB
+        import pathlib as _pl, sys as _sys
+        _sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
+        from colorspace import mesh_colors_to_srgb
+        mesh_colors_to_srgb(mesh)
+    except Exception as error:  # never block a generation over colours
+        log(f"Colour conversion skipped: {error}")
 
     obj_path = output_dir / "generated.obj"
     ply_path = output_dir / "generated.ply"
@@ -154,7 +168,9 @@ def main():
         started = time.time()
 
         try:
-            obj_path, ply_path = generate(engine, prompt, output)
+            obj_path, ply_path = generate(
+                engine, prompt, output,
+                steps=job.get("steps", 64), grid=job.get("grid", 128))
             emit(event="done", id=job_id, ok=True,
                  seconds=round(time.time() - started, 1),
                  obj=str(obj_path), ply=str(ply_path))

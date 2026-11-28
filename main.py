@@ -21,9 +21,8 @@ from PySide6.QtWidgets import (
 )
 
 APP_DIR = Path(__file__).resolve().parent
-SHAPE_E_HOME = Path(
-    os.environ.get("SHAPE_E_HOME", str(Path.home() / "shap-e"))
-).expanduser().resolve()
+from engine.engine_setup import resolve_home
+SHAPE_E_HOME = resolve_home()
 
 ENGINE = APP_DIR / "engine" / "generate.py"
 SERVER = APP_DIR / "engine" / "server.py"
@@ -71,6 +70,9 @@ from engine.batchtools import (
 )
 from engine.enhance_ui import EnhanceMixin
 from engine.cleanup_ui import CleanupMixin, best_mesh, purge_clean_files
+from engine.colors import make_meshdata, set_mesh_colors, add_color_toggle
+from engine.uxtools import install_help, fit_window
+from engine.engine_setup import install_engine_ui, ensure_engine
 
 ENGINE_PROC = PersistentEngine(SERVER, SHAPE_E_HOME)
 atexit.register(ENGINE_PROC.shutdown)
@@ -293,7 +295,7 @@ class ShapeForge(CleanupMixin, EnhanceMixin, QMainWindow):
         self.log.setReadOnly(True)
         left_layout.addWidget(self.log, 1)
 
-        self.status = QLabel("Ready • RTX 3060")
+        self.status = QLabel("Ready")
         self.status.setStyleSheet("color: #6ee7a0;")
         left_layout.addWidget(self.status)
 
@@ -334,6 +336,7 @@ class ShapeForge(CleanupMixin, EnhanceMixin, QMainWindow):
             self.mode_group.addButton(button)
             self.mode_buttons[name] = button
             mode_row.addWidget(button)
+        add_color_toggle(self, mode_row)
         mode_row.addStretch(1)
         reset_button = QPushButton("Reset Camera")
         reset_button.setStyleSheet(
@@ -406,6 +409,8 @@ class ShapeForge(CleanupMixin, EnhanceMixin, QMainWindow):
         self.enhance_generating(running)
 
     def generate(self):
+        if not ensure_engine(self):
+            return
         prompt = self.prompt.toPlainText().strip()
 
         if not prompt:
@@ -428,7 +433,7 @@ class ShapeForge(CleanupMixin, EnhanceMixin, QMainWindow):
 
         self.log.clear()
         self.log.append("Starting single generation...")
-        self.status.setText("Generating on RTX 3060...")
+        self.status.setText("Generating...")
 
         purge_clean_files(OUTPUT)
         self.latest_output_dir = OUTPUT
@@ -440,6 +445,8 @@ class ShapeForge(CleanupMixin, EnhanceMixin, QMainWindow):
         self.worker.start()
 
     def start_batch(self):
+        if not ensure_engine(self):
+            return
         prompts = parse_prompts(self.batch_prompts.toPlainText())
 
         if not prompts:
@@ -641,6 +648,7 @@ class ShapeForge(CleanupMixin, EnhanceMixin, QMainWindow):
 
         self.mesh_vertices = vertices
         self.mesh_faces = faces
+        set_mesh_colors(self, mesh)
         self.show_mesh()
         self.reset_camera()
         self.mesh_loaded(path)
@@ -655,9 +663,7 @@ class ShapeForge(CleanupMixin, EnhanceMixin, QMainWindow):
 
         mode = self.view_mode
         options = dict(
-            meshdata=gl.MeshData(
-                vertexes=self.mesh_vertices, faces=self.mesh_faces
-            ),
+            meshdata=make_meshdata(self),
             smooth=(mode == "Smooth"),
             drawFaces=(mode != "Wireframe"),
             drawEdges=(mode in ("Wireframe", "Solid + Edges")),
@@ -714,5 +720,8 @@ class ShapeForge(CleanupMixin, EnhanceMixin, QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = ShapeForge()
+    install_help(window)
+    install_engine_ui(window, ENGINE_PROC)
     window.show()
+    fit_window(window)
     sys.exit(app.exec())
